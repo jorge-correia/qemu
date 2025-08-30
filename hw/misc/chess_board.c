@@ -38,8 +38,6 @@
 #define CHESS_INTERRUPT_STATUS_DMA_END 1
 
 
-//TODO 64-bit regs
-
 DECLARE_INSTANCE_CHECKER(struct chess_board_state,CHESS_BOARD,TYPE_CHESS_BOARD)
 
 struct chess_board_state {
@@ -69,6 +67,8 @@ struct chess_board_state {
         uint32_t dma_info[CHESS_DMA_INFO_SIZE];
 
         uint32_t interrupt_status;
+
+        uint8_t *buff_gmalloc;
 };
 
         
@@ -77,14 +77,13 @@ struct chess_board_state {
 */
 static void chess_do_dma (struct chess_board_state *cbs, int rw)
 {
-
-        printf ("in dma!!! %d\n", rw);
         MemTxResult ret = MEMTX_OK;
 
+        /*
         volatile uint8_t* dev_ram_ptr =
                 memory_region_get_ram_ptr (&cbs->dev_ram_region);
+        */
 
-        //memset (dev_ram_ptr, 'j', CHESS_RAM_SIZE);
 
         /*
         if read, the dst is an offset inside dev RAM region and src is DMA
@@ -93,27 +92,31 @@ static void chess_do_dma (struct chess_board_state *cbs, int rw)
         DMA address, in simpler old systems, was the same as physical address.
         However, with IOMMU, this address need to be translated do physical 
         address.
+        In qemu, looks like there is no IOMMU. Even if I put the kernel
+        command line option "intel_iommu=on", pass "-cpu host" on qemu command 
+        line, looks like there is no address translation
         */
-        dma_addr_t src = (dma_addr_t)((((uint64_t)cbs->dma_info[CHESS_DMA_SRC_H]) << 32) |
-                cbs->dma_info[CHESS_DMA_SRC_L]);
+        dma_addr_t src =
+                (dma_addr_t)((((uint64_t)cbs->dma_info[CHESS_DMA_SRC_H]) << 32)
+                                | cbs->dma_info[CHESS_DMA_SRC_L]);
 
-        dma_addr_t dst = (dma_addr_t)(((uint64_t)(cbs->dma_info[CHESS_DMA_DST_H]) << 32) |
-                cbs->dma_info[CHESS_DMA_DST_L]);
+        dma_addr_t dst =
+                (dma_addr_t)(((uint64_t)(cbs->dma_info[CHESS_DMA_DST_H]) << 32)
+                                | cbs->dma_info[CHESS_DMA_DST_L]);
 
         dma_addr_t size = cbs->dma_info[CHESS_DMA_SIZE];
 
 
         switch (rw) {
                 case 1: // read
-                        for (int i = 0 ; i < 0x1000 ; i++)
-                                *(dev_ram_ptr + i) = 'j';
-                        printf("Performing DMA host -> device. Init byte %c,src %llx\n",*(uint8_t*)dev_ram_ptr);
-                        printf ("src: %llx\n", src);
-                        printf ("cbs->dma_info[CHESS_DMA_SRC_L]: %llx\n", cbs->dma_info[CHESS_DMA_SRC_L]);
-                        printf ("cbs->dma_info[CHESS_DMA_SRC_H]: %llx\n", cbs->dma_info[CHESS_DMA_SRC_H]);
+                        printf("Performing DMA host -> device\n");
+                        /*
                         ret = pci_dma_read (&cbs->parent_pci, src,
                                         (void*)(dev_ram_ptr + dst), size);
-                        printf("end DMA host -> device. Init byte %c\n",*(uint8_t*)dev_ram_ptr);
+                        */
+
+                        ret = pci_dma_read (&cbs->parent_pci, src,
+                                        (void*)(cbs->buff_gmalloc + dst), size);
                         if (ret != MEMTX_OK) {
                                 printf ("[CHESS-BOARD] error on DMA read\n");
                                 return;
@@ -122,8 +125,12 @@ static void chess_do_dma (struct chess_board_state *cbs, int rw)
 
                 case 2: // write
                         printf("Performing DMA device -> host\n");
+                        /*
                         ret = pci_dma_write (&cbs->parent_pci, dst,
                                         (void*)(dev_ram_ptr + src), size);
+                        */
+                        ret = pci_dma_write (&cbs->parent_pci, dst,
+                                        (void*)(cbs->buff_gmalloc + src), size);
                         if (ret != MEMTX_OK) {
                                 printf ("[CHESS-BOARD] error on DMA write\n");
                                 return;
@@ -218,7 +225,7 @@ static void chess_board_mmio_write (void *opaque, hwaddr addr, uint64_t val,
 {
         struct chess_board_state *cbs = opaque;
 
-        printf ("[CHESS-BOARD] writing value %ld of size %d bytes to addr %lx\n",
+        printf ("[CHESS-BOARD] writing value %ld. %d bytes to addr %lx\n",
                         val, size, addr);
 
         if (size > 4)
@@ -289,6 +296,7 @@ static void chess_board_realize (PCIDevice *pdev, Error **errp)
         struct chess_board_state *cbs = CHESS_BOARD(pdev);
         uint8_t *pci_conf = pdev->config;
 
+
         // enabling interrupts through physical interrupt pins
         pci_config_set_interrupt_pin(pci_conf, 1);
 
@@ -324,6 +332,16 @@ static void chess_board_realize (PCIDevice *pdev, Error **errp)
 
         for (int i = 0 ; i < 0x1000 ; i++)
                 *(dev_ram_ptr + i) = 'j';
+
+
+        cbs->buff_gmalloc = g_malloc0 (0x1000);
+        if (!cbs->buff_gmalloc){
+                printf ("error on gmalloc\n");
+                sleep (5);
+        }
+
+        for (int i = 0 ; i < 0x1000 ; i++)
+                *(cbs->buff_gmalloc + i) = 'Y';
 }
 
 
