@@ -301,11 +301,11 @@ static void chess_board_realize (PCIDevice *pdev, Error **errp)
         pci_config_set_interrupt_pin(pci_conf, 1);
 
         // enabling interrupts through MSI
-        /*
+        
         if (msi_init(pdev, 0, 1, true, false, errp)) {
                 return;
         }
-        */
+        
         
         
 
@@ -355,6 +355,46 @@ static void chess_board_instance_init (Object *obj)
         return;
 }
 
+/*
+just needed for debug. It starts calling pci_default_write_config() that does
+job, and the remaining code is just verifying if the job is done. Especially,
+we are verifying if the NMI is being set correctly
+
+this function is a callback executed when the driver writes some value to the
+configuration address space
+*/
+static void chess_board_device_config_write(PCIDevice *pci_dev,
+                uint32_t address, uint32_t val, int len)
+{
+        pci_default_write_config(pci_dev, address, val, len);
+
+        // find MSI capability struct
+        uint8_t msi_offset = pci_find_capability(pci_dev, PCI_CAP_ID_MSI);
+        if (msi_offset) {
+                uint16_t msg_data = 7;
+
+                // 64-bit addresses is enabled, checking for sanity
+                if (pci_get_word(pci_dev->config + msi_offset + PCI_MSI_FLAGS) &
+                        PCI_MSI_FLAGS_64BIT) {
+                        msg_data = pci_get_word(pci_dev->config + msi_offset +
+                        PCI_MSI_DATA_64);
+                        
+                } else {
+                        msg_data = pci_get_word(pci_dev->config + msi_offset +
+                        PCI_MSI_DATA_32);
+                }
+
+                uint8_t delivery_mode = (msg_data >> 8) & 0x7;
+                if (delivery_mode == 0x4) { // 0x4 tells NMI is enabled
+                        printf ("[CHESS-BOARD] delivery mode correct\n");
+                } else {
+                        printf ("[CHESS-BOARD] delivery mode incorrect %x\n",
+                        delivery_mode);
+                }
+        }
+}
+
+
 
 static void chess_board_class_init (ObjectClass *class, void *data)
 {
@@ -368,6 +408,7 @@ static void chess_board_class_init (ObjectClass *class, void *data)
         // I dont know how important is revision ID. 0x10 is random
         k->revision = 0x10;
         k->class_id = PCI_CLASS_OTHERS;
+        k->config_write = chess_board_device_config_write;
 
         set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
