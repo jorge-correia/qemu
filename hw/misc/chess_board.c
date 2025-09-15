@@ -3,6 +3,7 @@
 #include "hw/pci/pci.h"
 #include "hw/hw.h"
 #include "hw/pci/msi.h"
+#include "hw/pci/msix.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "qemu/main-loop.h" /* iothread mutex */
@@ -10,7 +11,7 @@
 #include "qapi/visitor.h"
 
 #define TYPE_CHESS_BOARD "chess-board"
-#define CHESS_BAR1_NAME "chess-board-BAR1"
+#define CHESS_BAR1_NAME "chess-board-BAR1-MSIX"
 
 #define CHESS_REG_COMMAND 0x0
 #define CHESS_REG_DMA_SRC_L 0x4
@@ -25,6 +26,7 @@
 #define CHESS_CMD_DMA_WRITE 2
 
 #define CHESS_DMA_INFO_SIZE 5 
+#define CHESS_DMA_ALLOC_SIZE 0x1000
 
 #define CHESS_DMA_SRC_L 0
 #define CHESS_DMA_SRC_H 1
@@ -36,6 +38,9 @@
 #define CHESS_RAM_SIZE 0x1000
 
 #define CHESS_INTERRUPT_STATUS_DMA_END 1
+
+#define CHESS_MSIX_MEMORY_REGION_SIZE 0x1000
+#define CHESS_MSIX_NVECS 2
 
 
 DECLARE_INSTANCE_CHECKER(struct chess_board_state,CHESS_BOARD,TYPE_CHESS_BOARD)
@@ -58,7 +63,10 @@ struct chess_board_state {
         is mapped on the host physical memory address space, and its address is
         set in the same way as the mmio region
         */
-        MemoryRegion dev_ram_region;
+        //MemoryRegion dev_ram_region;
+
+	// MSI-X table
+	MemoryRegion msix_table;
 
 
         // registers
@@ -77,13 +85,8 @@ struct chess_board_state {
 */
 static void chess_do_dma (struct chess_board_state *cbs, int rw)
 {
+	static int turn = 0;
         MemTxResult ret = MEMTX_OK;
-
-        /*
-        volatile uint8_t* dev_ram_ptr =
-                memory_region_get_ram_ptr (&cbs->dev_ram_region);
-        */
-
 
         /*
         if read, the dst is an offset inside dev RAM region and src is DMA
@@ -92,9 +95,9 @@ static void chess_do_dma (struct chess_board_state *cbs, int rw)
         DMA address, in simpler old systems, was the same as physical address.
         However, with IOMMU, this address need to be translated do physical 
         address.
-        In qemu, looks like there is no IOMMU. Even if I put the kernel
-        command line option "intel_iommu=on", pass "-cpu host" on qemu command 
-        line, looks like there is no address translation
+        In qemu, looks like there is no IOMMU. Even if I put the kernel option
+	"intel_iommu=on", pass "-cpu host" on qemu command line, looks like
+	there is no address translation
         */
         dma_addr_t src =
                 (dma_addr_t)((((uint64_t)cbs->dma_info[CHESS_DMA_SRC_H]) << 32)
@@ -110,11 +113,6 @@ static void chess_do_dma (struct chess_board_state *cbs, int rw)
         switch (rw) {
                 case 1: // read
                         printf("Performing DMA host -> device\n");
-                        /*
-                        ret = pci_dma_read (&cbs->parent_pci, src,
-                                        (void*)(dev_ram_ptr + dst), size);
-                        */
-
                         ret = pci_dma_read (&cbs->parent_pci, src,
                                         (void*)(cbs->buff_gmalloc + dst), size);
                         if (ret != MEMTX_OK) {
@@ -125,10 +123,6 @@ static void chess_do_dma (struct chess_board_state *cbs, int rw)
 
                 case 2: // write
                         printf("Performing DMA device -> host\n");
-                        /*
-                        ret = pci_dma_write (&cbs->parent_pci, dst,
-                                        (void*)(dev_ram_ptr + src), size);
-                        */
                         ret = pci_dma_write (&cbs->parent_pci, dst,
                                         (void*)(cbs->buff_gmalloc + src), size);
                         if (ret != MEMTX_OK) {
@@ -140,11 +134,24 @@ static void chess_do_dma (struct chess_board_state *cbs, int rw)
                         return;
         }
 
-        // assert interrupt to signal the end of DMA
+        // signaling the end of DMA
         cbs->interrupt_status = rw;
-        
-        if (msi_enabled (&cbs->parent_pci))
-        {
+
+	if (msix_enabled (&cbs->parent_pci)){
+		
+		if (turn % 2){
+			printf ("[CHESS-BOARD] sending MSI-X 0 (NMI)\n");
+			msix_notify (&cbs->parent_pci, 0);
+		}
+		else{
+			printf ("[CHESS-BOARD] sending MSI-X 1(REGULAR)\n");
+			msix_notify (&cbs->parent_pci, 1);
+		
+		}
+		turn ++;
+	
+	}
+	else if (msi_enabled (&cbs->parent_pci)) {
                 printf ("[CHESS-BOARD] sending MSI\n");
                 msi_notify (&cbs->parent_pci, 0);
         }
@@ -154,7 +161,6 @@ static void chess_do_dma (struct chess_board_state *cbs, int rw)
                 // assert electrical signal
                 pci_set_irq (&cbs->parent_pci, 1);
         }
-        
 }
 
 
@@ -200,7 +206,9 @@ static uint64_t chess_board_mmio_read (void *opaque, hwaddr addr,
                         ret = cbs->interrupt_status;
                         cbs->interrupt_status = 0;
 
-                        if (!msi_enabled (&cbs->parent_pci)) {
+			if (!msi_enabled (&cbs->parent_pci) &&
+					!msix_enabled (&cbs->parent_pci)){
+
                                 // deasserting IRQ signal
                                 printf ("[CHESS-BOARD] deasserting IRQ\n");
                                 pci_set_irq (&cbs->parent_pci, 0);
@@ -283,7 +291,7 @@ static const MemoryRegionOps chess_board_mmio_ops = {
                 .min_access_size = 4,
                 .max_access_size = 8,
         },
-        // used as a hint to optimization
+        // used as a hint for optimization
         .impl = {
                 .min_access_size = 4,
                 .max_access_size = 8,
@@ -296,22 +304,13 @@ static void chess_board_realize (PCIDevice *pdev, Error **errp)
         struct chess_board_state *cbs = CHESS_BOARD(pdev);
         uint8_t *pci_conf = pdev->config;
 
-
-        // enabling interrupts through physical interrupt pins
-        pci_config_set_interrupt_pin(pci_conf, 1);
-
-        // enabling interrupts through MSI
-        
-        if (msi_init(pdev, 0, 1, true, false, errp)) {
-                return;
-        }
-        
-        
-        
-
+	// initial arbitrary value
         cbs->reg = 11;
 
-        /* 0x1000 bytes long, but only two register is handled in read/write
+
+	/* 
+	creating mmio region for accessing internal device registers
+        0x1000 bytes long, but only few registers are handled in read/write
         mmio callbacks
         */
         memory_region_init_io (&cbs->mmio_region, OBJECT (cbs),
@@ -321,27 +320,68 @@ static void chess_board_realize (PCIDevice *pdev, Error **errp)
         pci_register_bar (pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY,
                         &cbs->mmio_region);
 
-        memory_region_init_ram (&cbs->dev_ram_region, OBJECT(cbs),
-                        CHESS_BAR1_NAME, CHESS_RAM_SIZE, errp);
-
-        pci_register_bar (pdev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY,
-                        &cbs->dev_ram_region);
-
-        volatile uint8_t* dev_ram_ptr =
-                memory_region_get_ram_ptr (&cbs->dev_ram_region);
-
-        for (int i = 0 ; i < 0x1000 ; i++)
-                *(dev_ram_ptr + i) = 'j';
-
-
-        cbs->buff_gmalloc = g_malloc0 (0x1000);
+	/*
+	 creating DMA region
+	*/
+        cbs->buff_gmalloc = g_malloc0 (CHESS_DMA_ALLOC_SIZE);
         if (!cbs->buff_gmalloc){
                 printf ("error on gmalloc\n");
-                sleep (5);
         }
 
-        for (int i = 0 ; i < 0x1000 ; i++)
+	// initial arbitrary value
+        for (int i = 0 ; i < CHESS_DMA_ALLOC_SIZE ; i++)
                 *(cbs->buff_gmalloc + i) = 'Y';
+
+	/*
+	 enabling interrupts via MSI-X
+	 MSI-X requires an mmio region to map MSI-X table. Note that this does
+	 not allocate memory for the table. It only creates an mmio mapping. The
+	 memory is actually allocated inside msix_init function and pointed by
+	 parent PCIDevice pdev->maix_table. 
+	 Also note that we dont create callback functions to handle read and
+	 writes to this mmio region. They are registered in msix_init function.
+	 This can be done because this memory region that we are creating here 
+	 is registered as a subregion of a memory region created inside
+	 msix_init, which, in turn, registers the read/write callbacks. These
+	 callbacks reads and writes to the memory pointed by pdev->msix_table.
+	*/
+	memory_region_init (&cbs->msix_table, OBJECT(cbs), CHESS_BAR1_NAME,
+			CHESS_MSIX_MEMORY_REGION_SIZE);
+	pci_register_bar (pdev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY,
+			&cbs->msix_table);
+	/*
+	 I dont think 0x800 is necessary, since we only have two entries in
+	 MSIX table. But I will leave some space in case we increase the number
+	 of vectors
+	*/
+	if (msix_init (pdev, CHESS_MSIX_NVECS, &cbs->msix_table, 1, 0,
+				&cbs->msix_table, 1, 0x800, 0, errp) < 0){
+
+		printf ("[CHESS-BOARD] MSI-X error\n");
+		return;
+	}
+
+	for (uint32_t i = 0; i < CHESS_MSIX_NVECS; i++)
+		msix_vector_use(pdev, i);
+
+	/*
+	// this is an alternative. I can use the exclusive_bar inside parent_pci
+	if (msix_init_exclusive_bar(pdev, 2 , 1, errp)) {
+		printf ("[CHESS-BOARD] MSI-X error\n");
+		return;
+	}
+	*/
+
+	
+        // enabling interrupts through physical interrupt pins
+        pci_config_set_interrupt_pin(pci_conf, 1);
+
+        // enabling interrupts through MSI
+	/*
+	if (msi_init(pdev, 0, 1, true, false, errp)) {
+		return;
+	}
+	*/
 }
 
 
